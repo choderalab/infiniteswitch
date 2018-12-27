@@ -26,7 +26,7 @@ setup(
     license='MIT',
 
     # Which Python importable modules should be included when your package is installed
-    packages=['infiniteswitch', "infiniteswitch.tests"],
+    packages=['infiniteswitch', "infiniteswitch.storage", "infiniteswitch.tests"],
 
     # Optional include package data to ship with your package
     # Comment out this line to prevent the files from being packaged with your software

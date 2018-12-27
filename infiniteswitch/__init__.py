@@ -3,12 +3,9 @@ Infinite Switch Hamiltonian Exchange
 Implementation and testing of the InfiniteSwitchIntegrator.
 """
 
-# Make Python 2 and 3 imports work the same
-# Safe to remove with Python 3-only code
-from __future__ import absolute_import
-
 # Add imports here
 from .infiniteswitch import *
+from .storage import *
 
 # Handle versioneer
 from ._version import get_versions
