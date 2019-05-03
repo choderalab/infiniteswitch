@@ -14,10 +14,11 @@ from simtk import openmm, unit
 from infiniteswitch import (InfiniteSwitchIntegrator,
                             get_linearly_interpolated_path,
                             determine_quadrature)
+from infiniteswitch.storage import Storage, NetCDFArray
 
 
 # ==============================================================================
-# Harmonic oscillator simulations.
+# Helper functions to analyze the harmonic oscillator.
 # ==============================================================================
 
 def compute_harmonic_oscillator_log_z(K, temperature):
@@ -54,42 +55,84 @@ def compute_Df_ij(f_i):
     return Df_ij
 
 
+# ==============================================================================
+# Harmonic oscillator simulations.
+# ==============================================================================
+
+def create_storage_schema(n_quadrature_nodes):
+        """Create the Storage schema with the appropriate data dimensions."""
+
+        class SimulationStorage(Storage):
+            z_i_computed = NetCDFArray(
+                relative_file_path='storage.nc',
+                variable_path='z_i_computed',
+                datatype='f8',
+                is_appendable=True,
+                dimensions=[('iteration1', 0), ('quadrature_node', n_quadrature_nodes)]
+            )
+            Df_i_computed = NetCDFArray(
+                relative_file_path='storage.nc',
+                variable_path='Df_i_computed',
+                datatype='f8',
+                is_appendable=True,
+                dimensions=[('iteration2', 0), ('quadrature_node', n_quadrature_nodes)]
+            )
+            ee_weights = NetCDFArray(
+                relative_file_path='storage.nc',
+                variable_path='ee_weights',
+                datatype='f8',
+                is_appendable=True,
+                dimensions=[('iteration3', 0), ('quadrature_node', n_quadrature_nodes)]
+            )
+            positions = NetCDFArray(
+                relative_file_path='storage.nc',
+                variable_path='positions',
+                datatype='f8',
+                is_appendable=True,
+                dimensions=[('iteration4', 0), ('spatial', 3)]
+            )
+
+        return SimulationStorage
+
+
 class HarmonicOscillatorSimulation:
     """Infinite switch serialize tempering with harmonic oscillator."""
 
     REFERENCE_BETA = 1/(kB * 250.0*unit.kelvin)
     END_POINTS_BETA = [1/(kB * 200.0*unit.kelvin), 1/(kB * 300.0*unit.kelvin)]
 
-    def __init__(self, timestep=2.0*unit.femtoseconds, n_quadrature_nodes=20):
-        """Shared test cases for the test suite."""
+    def __init__(self, storage_directory, timestep=2.0*unit.femtoseconds, n_quadrature_nodes=20):
         self.n_quadrature_nodes = n_quadrature_nodes
 
-        # Construct the temperature path.
-        beta_a, beta_b = [self.END_POINTS_BETA[i]/self.REFERENCE_BETA for i in [0, 1]]
-        temperature_ladder, temperature_ladder_derivative = get_linearly_interpolated_path(beta_a, beta_b)
-
-        # Configure quadrature nodes.
-        self.quadrature_nodes, self.quadrature_weights, self.path_derivative = determine_quadrature(
-            temperature_ladder, temperature_ladder_derivative, deg=self.n_quadrature_nodes)
-        self.end_point_nodes = [temperature_ladder(node) for node in [-1, 1]]
+        # Create/restore storage.
+        Schema = create_storage_schema(n_quadrature_nodes)
+        self.storage = Schema(storage_directory, open_mode='a')
 
         # Create and configure simulation object.
         harmonic_oscillator = mmtools.testsystems.HarmonicOscillator(mass=12.0*unit.amu)
         system = harmonic_oscillator.system
         self.K = harmonic_oscillator.K
 
+        # Construct the temperature path.
+        beta_a, beta_b = [self.END_POINTS_BETA[i]/self.REFERENCE_BETA for i in [0, 1]]
+        temperature_ladder, temperature_ladder_derivative = get_linearly_interpolated_path(beta_a, beta_b)
+        # Configure quadrature nodes.
+        self.quadrature_nodes, self.quadrature_weights, self.path_derivative = determine_quadrature(
+            temperature_ladder, temperature_ladder_derivative, deg=self.n_quadrature_nodes)
+        # TODO: self.end_point_nodes = [temperature_ladder(node) for node in [-1, 1]]
+
         # The protocol modifies the potential of the only force in the system.
         assert system.getNumForces() == 1
         self.quadrature_nodes = {0: [node[0] for node in self.quadrature_nodes]}
 
         # Create infinite switch integrator.
-        self.integrator = InfiniteSwitchIntegrator(system, self.quadrature_nodes, self.path_derivative,
-                                                  self.quadrature_weights, timestep=timestep)
-        self.kT = (kB * self.integrator.getTemperature()).value_in_unit_system(unit.md_unit_system)
+        integrator = InfiniteSwitchIntegrator(system, self.quadrature_nodes, self.path_derivative,
+                                              self.quadrature_weights, timestep=timestep)
+
         # Create context.
-        self.context = openmm.Context(harmonic_oscillator.system, self.integrator)
+        self.context = openmm.Context(harmonic_oscillator.system, integrator)
         self.context.setPositions(harmonic_oscillator.positions)
-        self.context.setVelocitiesToTemperature(self.integrator.getTemperature())
+        self.context.setVelocitiesToTemperature(integrator.getTemperature())
 
         # Compute expected free energy differences.
         f_i_analytical = []
@@ -100,31 +143,25 @@ class HarmonicOscillatorSimulation:
             f_i_analytical.append(log_z)
         self.Df_ij_analytical = compute_Df_ij(f_i_analytical)
 
-        # Step on integrator to generate variables.
-        self.integrator.step(1)
+    @property
+    def integrator(self):
+        return self.context.getIntegrator()
 
     def run_harmonic_oscillator(self, n_iterations, n_steps_per_iteration):
         """Run the system and collect the free energy trajectories."""
-        for trajectory_name in ['z_i_computed', 'Df_i_computed', 'ee_weights']:
-            setattr(self, trajectory_name, np.empty((self.n_quadrature_nodes, n_iterations)))
-        self.positions = np.empty((3, n_iterations))
-
         for iteration in range(n_iterations):
             self.integrator.step(n_steps_per_iteration)
-            z_i_computed = np.array(self.integrator.get_nodes_partition_functions())
-            self.z_i_computed[:, iteration] = z_i_computed
-            self.Df_i_computed[:, iteration] = compute_Df_ij(-np.log(z_i_computed))[0]
-            self.ee_weights[:, iteration] = self.integrator.get_nodes_expanded_ensemble_weights()
-            self.positions[:, iteration] = self.context.getState(getPositions=True).getPositions(asNumpy=True)[0]
+            self._store_iteration()
 
-    def save_data(self, data_directory):
-        os.makedirs(data_directory, exist_ok=True)
-        for attribute_name in ['z_i_computed', 'Df_i_computed', 'ee_weights', 'positions']:
-            np.save(os.path.join(data_directory, attribute_name + '.npy'), getattr(self, attribute_name))
-
-    def restore_data(self, data_directory):
-        for attribute_name in ['z_i_computed', 'Df_i_computed', 'ee_weights', 'positions']:
-            setattr(self, attribute_name, np.load(os.path.join(data_directory, attribute_name + '.npy')))
+    def _store_iteration(self):
+        z_i_computed = np.array(self.integrator.get_nodes_partition_functions())
+        self.storage.z_i_computed.append(z_i_computed)
+        computed_Df_ij = compute_Df_ij(-np.log(z_i_computed))[0]
+        self.storage.Df_i_computed.append(computed_Df_ij)
+        ee_weights = self.integrator.get_nodes_expanded_ensemble_weights()
+        self.storage.ee_weights.append(ee_weights)
+        positions = self.context.getState(getPositions=True).getPositions(asNumpy=True)[0]
+        self.storage.positions.append(positions)
 
     def analyze(self, analysis_directory):
         """Plot the free energy trajectories for all quadrature nodes."""
@@ -140,11 +177,11 @@ class HarmonicOscillatorSimulation:
                 fig.savefig(file_path)
 
         sns.set_style('whitegrid')
-        palette = sns.color_palette('coolwarm', n_colors=simulation.n_quadrature_nodes)
+        palette = sns.color_palette('coolwarm', n_colors=self.n_quadrature_nodes)
 
         # Free energy trajectories.
         fig1, ax1 = plt.subplots()
-        for i, Df_trajectory in enumerate(self.Df_i_computed):
+        for i, Df_trajectory in enumerate(self.storage.Df_i_computed.transpose()):
             ax1.plot(Df_trajectory, color=palette[i])
             # Plot reference line.
             reference_Df = self.Df_ij_analytical[0][i]
@@ -156,7 +193,7 @@ class HarmonicOscillatorSimulation:
 
         # Expanded ensemble weights.
         fig2, ax2 = plt.subplots()
-        for i, w_trajectory in enumerate(self.ee_weights):
+        for i, w_trajectory in enumerate(self.storage.ee_weights.transpose()):
             ax2.plot(w_trajectory, color=palette[i])
         ax2.set_xlabel('iteration')
         ax2.set_ylabel('expanded ensemble weight')
@@ -164,7 +201,7 @@ class HarmonicOscillatorSimulation:
 
         # X-coordinate.
         fig3, ax3 = plt.subplots()
-        radius = [np.linalg.norm(pos) for pos in self.positions.transpose()]
+        radius = [np.linalg.norm(pos) for pos in self.storage.positions]
         # phi = 1/np.cos(self.positions[2]/radius)
         sns.distplot(radius, ax=ax3, label='simulated')
         histogram_height = max([h.get_height() for h in ax3.patches])
@@ -201,11 +238,9 @@ class HarmonicOscillatorSimulation:
 
 if __name__ == '__main__':
     harmonic_oscillator_dir = os.path.join('..', 'data', 'harmonic_oscillator')
-
-    simulation = HarmonicOscillatorSimulation(n_quadrature_nodes=50)
+    simulation = HarmonicOscillatorSimulation(storage_directory=harmonic_oscillator_dir,
+                                              n_quadrature_nodes=20)
     simulation.run_harmonic_oscillator(n_iterations=2000, n_steps_per_iteration=500)
-    simulation.save_data(harmonic_oscillator_dir)
-    # simulation.restore_data(harmonic_oscillator_dir)
-    # simulation.analyze(harmonic_oscillator_dir)
+    simulation.analyze(harmonic_oscillator_dir)
 
 

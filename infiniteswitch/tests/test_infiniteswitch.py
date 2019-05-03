@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 
 """
-Unit and regression test for the infiniteswitch package.
+Unit and regression test for the infiniteswitch module.
 """
 
 # ==============================================================================
